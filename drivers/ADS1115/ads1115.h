@@ -1,9 +1,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "esp_log.h"
-#include "freertos/timers.h"
 #include "esp_mac.h"
 #include "driver/i2c.h"
 #include "driver/gpio.h"
@@ -87,3 +85,4 @@
 #define DISABLE_COMPARATOR   (0b11) // default
 
 esp_err_t ads_init(void);
+esp_err_t ads_read(const uint8_t channel, const uint8_t relative_to, uint16_t *value);

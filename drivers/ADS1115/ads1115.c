@@ -1,8 +1,14 @@
 #include "ads.h"
 
 static const char *TAG = "ads";
+static bool ads_initialised = false;
 
 esp_err_t ads_init(void) {
+    if (ads_initialised) {
+        ESP_LOGI(TAG, "ADS already initialised.");
+        return ESP_OK;
+    }
+
     const i2c_config_t i2c_config = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = GPIO_NUM_22,
@@ -12,16 +18,18 @@ esp_err_t ads_init(void) {
         .scl_pullup_en = GPIO_PULLUP_ENABLE
     };
 
-    esp_err_t c =  i2c_param_config(I2C_NUM_0, &i2c_config);
+    const esp_err_t c =  i2c_param_config(I2C_NUM_0, &i2c_config);
     if (c != ESP_OK) {
         ESP_LOGE(TAG, "i2c_param_config failed (%d)", c);
         return c;
     }
-    static esp_err_t d = i2c_driver_install(I2C_NUM_0, i2c_config.mode, 0, 0, 0);
+    const esp_err_t d = i2c_driver_install(I2C_NUM_0, i2c_config.mode, 0, 0, 0);
     if (d != ESP_OK) {
         ESP_LOGE(TAG, "i2c_driver_install failed (%d)", d);
         return d;
     }
+
+    ads_initialised = true;
 
     return ESP_OK;
 }
@@ -69,10 +77,10 @@ esp_err_t ads_config(const uint8_t channel, const uint8_t relative_to) {
         return ret;
     }
 
-    const uint8_t mux_setup = mux_value(channel, relative_to) << 12;
+    const uint8_t mux_setup = mux_value(channel, relative_to);
 
     const uint16_t conf_word =  CONFIG_OS_READ << 15 |
-                                mux_setup |
+                                ((uint16_t)mux_setup) << 12 |
                                 PGA_FSR_4_096 << 9 |
                                 MODE_SINGLE_SHOT << 8 |
                                 DR_128_SPS << 5 |
@@ -118,5 +126,99 @@ esp_err_t ads_config(const uint8_t channel, const uint8_t relative_to) {
 err_finish:
     i2c_cmd_link_delete(cmd);
     ESP_LOGE(TAG, "I2C Error writing byte to a slave %d", ret);
+    return ret;
+}
+
+bool os_ready(void) {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    if (cmd == NULL) {
+        ESP_LOGE(TAG, "i2c_cmd_link_create failed");
+        return false;
+    }
+    i2c_master_start(cmd);
+
+    esp_err_t e = i2c_master_write_byte(cmd, (SLAVE_ADDRESS << 1) | I2C_MASTER_WRITE, I2C_MASTER_ACK);
+    if (e != ESP_OK) goto err_finish;
+
+    e = i2c_master_write_byte(cmd, CONFIG_REGISTER, I2C_MASTER_ACK);
+    if (e != ESP_OK) goto err_finish;
+
+    i2c_master_start(cmd);
+    e = i2c_master_write_byte(cmd, (SLAVE_ADDRESS << 1) | I2C_MASTER_READ, I2C_MASTER_ACK);
+    if (e != ESP_OK) goto err_finish;
+
+    uint8_t msb8_value = 0;
+    e = i2c_master_read_byte(cmd, &msb8_value, I2C_MASTER_ACK);
+    if (e != ESP_OK) goto err_finish;
+
+    uint8_t lsb8_value = 0;
+    e = i2c_master_read_byte(cmd, &lsb8_value, I2C_MASTER_ACK);
+    if (e != ESP_OK) goto err_finish;
+
+    i2c_master_stop(cmd);
+    e = i2c_master_cmd_begin(I2C_NUM_0, cmd, 1000 / portTICK_PERIOD_MS);
+    if (e != ESP_OK) goto err_finish;
+
+    const uint8_t os_value = msb8_value >> 7;
+
+    if (os_value == 1) {
+        return true;
+    }
+    return false;
+
+err_finish:
+    ESP_LOGE(TAG, "i2c master operation failed %d", e);
+    i2c_cmd_link_delete(cmd);
+    return false;
+}
+
+esp_err_t ads_read(const uint8_t channel, const uint8_t relative_to, uint16_t *value) {
+    esp_err_t ret = ads_config(channel, relative_to);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ads_read failed");
+        return ret;
+    }
+
+    for (;;) {
+        if (os_ready()) break;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    if (cmd == NULL) {
+        ESP_LOGE(TAG, "i2c_cmd_link_create failed");
+        return ESP_FAIL;
+    }
+    i2c_master_start(cmd);
+
+    ret = i2c_master_write_byte(cmd, (SLAVE_ADDRESS << 1) | I2C_MASTER_WRITE, I2C_MASTER_ACK);
+    if (ret != ESP_OK) goto err_finish;
+
+    ret = i2c_master_write_byte(cmd, CONVERSION_REGISTER, I2C_MASTER_ACK);
+    if (ret != ESP_OK) goto err_finish;
+
+    i2c_master_start(cmd);
+    ret = i2c_master_write_byte(cmd, (SLAVE_ADDRESS << 1) | I2C_MASTER_READ, I2C_MASTER_ACK);
+    if (ret != ESP_OK) goto err_finish;
+
+    uint8_t msb_data = 0;
+    ret = i2c_master_read_byte(cmd, &msb_data, I2C_MASTER_ACK);
+    if (ret != ESP_OK) goto err_finish;
+
+    uint8_t lsb_data = 0;
+    ret = i2c_master_read_byte(cmd, &lsb_data, I2C_MASTER_NACK);
+    if (ret != ESP_OK) goto err_finish;
+
+    i2c_master_stop(cmd);
+    ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, 1000 / portTICK_PERIOD_MS);
+    if (ret != ESP_OK) goto err_finish;
+
+    i2c_cmd_link_delete(cmd);
+    *value = (msb_data << 8) | lsb_data;
+    return ret;
+
+err_finish:
+    ESP_LOGE(TAG, "i2c master action failed %d", ret);
+    i2c_cmd_link_delete(cmd);
     return ret;
 }
