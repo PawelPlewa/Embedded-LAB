@@ -85,4 +85,4 @@
 #define DISABLE_COMPARATOR   (0b11) // default
 
 esp_err_t ads_init(void);
-esp_err_t ads_read(const uint8_t channel, const uint8_t relative_to, uint16_t *value);
+esp_err_t ads_read(const uint8_t channel, const uint8_t relative_to, const double max_voltage_input, uint16_t *value);
