@@ -1,8 +1,9 @@
 /*
-* Filename: ads.c
+ * Filename: ads.c
  * Author: Paweł Plewa
  * Description: A driver for an easy usage of ADS111x made for ESP32 series.
  * License: MIT
+ * LinkedIn: www.linkedin.com/in/paweł-plewa-78b398250
  */
 
 #include "ads.h"
@@ -107,32 +108,27 @@ uint8_t mux_value(const uint8_t channel, const uint8_t relative_to) {
  * based on the user-provided max voltage input.
  * Those bits serve no function on ADS1113.
  */
-uint8_t pga_value(const double max_voltage_input) {
+uint8_t pga_value(const double vdd) {
     // there are 6 possible PGA setups
     const uint8_t pga_options_quantity = 6;
     // variable for storing the right FSR
     double pga_range_found = 0;
+    const double maximum_rating = vdd + 0.3;
 
     // 6 possible FSRs
     const double pga_available[] = {0.256, .512, 1.024, 2.048, 4.096, 6.144};
     for (int i = 0; i < pga_options_quantity; i++) {
-        // we iterate until we find a value smaller than max_voltage_input
-        // or we are at the last iteration.
-        if (max_voltage_input <= pga_available[i] || i == pga_options_quantity - 1) {
-            if (i == 0) {
-                pga_range_found = pga_available[i]; // we choose the smallest FSR
-                break;
-            }
-            else {
-                // we choose between 2 FSRs in between
-                const double left_value = pga_available[i-1];
-                const double right_value = pga_available[i];
-                // we pick the one with a smaller difference
-                pga_range_found = ((max_voltage_input - left_value) >= (right_value - max_voltage_input)) ? right_value : left_value;
-                break;
-            }
+        // we iterate until we find a value larger than the maximum rating
+        if (maximum_rating < pga_available[i]) {
+            pga_range_found = pga_available[i];
+            break;
         }
     }
+    if (pga_range_found == 0) {
+        ESP_LOGI(TAG, "No proper PGA range was found, defaulting to 2.048V");
+    }
+
+    // ESP_LOGI("PGA", "FSR %d", (int)pga_range_found);
 
     // then we match the found range with a proper bit sequence.
     if (pga_range_found == .256) return PGA_FSR_0_256;
@@ -294,7 +290,7 @@ err_finish:
  * a proper PGA FSR setting. The 4th argument is a pointer
  * to a uint16_t value, where the read value will be stored
  */
-esp_err_t ads_read(const uint8_t channel, const uint8_t relative_to, const double max_voltage_input, uint16_t *value) {
+esp_err_t ads_read(const uint8_t channel, const uint8_t relative_to, const double max_voltage_input, int16_t *value) {
     // first, configuration of an ADS111x
     esp_err_t ret = ads_config(channel, relative_to, max_voltage_input);
     if (ret != ESP_OK) {
@@ -351,11 +347,59 @@ esp_err_t ads_read(const uint8_t channel, const uint8_t relative_to, const doubl
 
     // delete the command link
     i2c_cmd_link_delete(cmd);
-    *value = (((uint16_t)msb_data) << 8) | lsb_data;
+    // getting answer from the Conversion Register
+    const uint16_t raw = (((uint16_t)msb_data) << 8) | lsb_data;
+    // interpreting it as 2's complement
+    *value = (int16_t)raw;
     return ret;
 
 err_finish:
     ESP_LOGE(TAG, "i2c master action failed %d", ret);
     i2c_cmd_link_delete(cmd);
     return ret;
+}
+
+/*
+ * The function below is used to convert
+ * the digital value to the analog one.
+ * Although ADS111x is a 16bit adc, the user
+ * will not always be using its full range.
+ * If the PGA FSR is set to 4.096V, but the
+ * supply voltage is 3.3V, only the voltage
+ * up to 3.3-3.6V can be reliably read.
+ */
+double digital_to_analog(const double vdd, const int16_t value) {
+    /* First, we must know our PGA full-scale range.
+     * Based on the setting of the ADS's PGA,
+     * the size of the LSB changes.
+     */
+    const uint8_t pga_range = pga_value(vdd);
+    double lsb_size = 0;
+    // choose the LSB's size according to the docs.
+    switch (pga_range) {
+        case PGA_FSR_0_256:
+            lsb_size = 7.8125e-6;
+            break;
+        case PGA_FSR_0_512:
+            lsb_size = 15.625e-6;
+            break;
+        case PGA_FSR_1_024:
+            lsb_size = 31.25e-6;
+            break;
+        case PGA_FSR_2_048:
+            lsb_size = 62.5e-6;
+            break;
+        case PGA_FSR_4_096:
+            lsb_size = 125e-6;
+            break;
+        case PGA_FSR_6_144:
+            lsb_size = 187.5e-6;
+            break;
+        default:
+            lsb_size = 62.5e-6;
+            break;
+    }
+
+    // return the analog value
+    return value * lsb_size;
 }
