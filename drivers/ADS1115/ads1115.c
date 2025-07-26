@@ -11,7 +11,29 @@
 // ESP logs tag
 static const char *TAG = "ads";
 
-esp_err_t ads_init(void) {
+/*
+ * This function checks if user's
+ * pin of choice is suitable for
+ * a usage of I2C communication.
+ * ESP-IDF's SoC-specific definitions reliant.
+ */
+bool gpio_valid(const gpio_num_t gpio_num) {
+    // first check if such pin exists
+    if (!GPIO_IS_VALID_GPIO(gpio_num)) {
+        ESP_LOGE(TAG, "GPIO%d is not a valid physical pin on an %s chip", gpio_num, CONFIG_IDF_TARGET);
+        return false;
+    }
+
+    // check if the pin has output capability
+    if (!GPIO_IS_VALID_OUTPUT_GPIO(gpio_num)) {
+        ESP_LOGE(TAG, "GPIO%d does not have an output capability on an %s and cannot be used for either SDA or SCL.", gpio_num, CONFIG_IDF_TARGET);
+        return false;
+    }
+
+    return true;
+}
+
+esp_err_t ads_init(const gpio_num_t sda_pin_num, const gpio_num_t scl_pin_num, const i2c_port_t i2c_port_num, const uint32_t clk_speed) {
     // bool value preventing user from
     // trying to install the same i2c
     // drivers on ESP32 board twice
@@ -21,23 +43,38 @@ esp_err_t ads_init(void) {
         return ESP_OK;
     }
 
+    // validate I2C pin numbers before initialization
+    if (!gpio_valid(sda_pin_num)) {
+        ESP_LOGE(TAG, "Invalid sda pin %d.", sda_pin_num);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!gpio_valid(scl_pin_num)) {
+        ESP_LOGE(TAG, "Invalid scl pin %d.", scl_pin_num);
+        return ESP_ERR_INVALID_ARG;
+    }
+    // check if the port number is within the valid range
+    if (i2c_port_num >= I2C_NUM_MAX) {
+        ESP_LOGE(TAG, "Invalid port number %d on an %s chip.", i2c_port_num, CONFIG_IDF_TARGET);
+        return ESP_ERR_INVALID_ARG;
+    }
+
     // configuration of I2C interface
     const i2c_config_t i2c_config = {
         .mode = I2C_MODE_MASTER, // our ESP32 is in a master mode
-        .sda_io_num = GPIO_NUM_22,
-        .scl_io_num = GPIO_NUM_21,
-        .master.clk_speed = 100000, // clock speed 100kHz
+        .sda_io_num = sda_pin_num,
+        .scl_io_num = scl_pin_num,
+        .master.clk_speed = clk_speed, // clock speed 100kHz
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE
     };
 
-    const esp_err_t c =  i2c_param_config(I2C_NUM_0, &i2c_config);
+    const esp_err_t c =  i2c_param_config(i2c_port_num, &i2c_config);
     if (c != ESP_OK) {
         ESP_LOGE(TAG, "i2c_param_config failed (%d)", c);
         return c;
     }
     // after configuration, installing an I2C driver
-    const esp_err_t d = i2c_driver_install(I2C_NUM_0, i2c_config.mode, 0, 0, 0);
+    const esp_err_t d = i2c_driver_install(i2c_port_num, i2c_config.mode, 0, 0, 0);
     if (d != ESP_OK) {
         ESP_LOGE(TAG, "i2c_driver_install failed (%d)", d);
         return d;
@@ -128,8 +165,6 @@ uint8_t pga_value(const double vdd) {
         ESP_LOGI(TAG, "No proper PGA range was found, defaulting to 2.048V");
     }
 
-    // ESP_LOGI("PGA", "FSR %d", (int)pga_range_found);
-
     // then we match the found range with a proper bit sequence.
     if (pga_range_found == .256) return PGA_FSR_0_256;
     else if (pga_range_found == .512) return PGA_FSR_0_512;
@@ -144,7 +179,7 @@ uint8_t pga_value(const double vdd) {
  * Function that configurates ADS
  * to work in a single-shot mode.
  */
-esp_err_t ads_config(const uint8_t channel, const uint8_t relative_to, const double max_voltage_input) {
+esp_err_t ads_config(const uint8_t channel, const uint8_t relative_to, const i2c_port_t i2c_port_num, const double max_voltage_input) {
     // first, perform an error-check.
     esp_err_t ret = config_error_check(channel, relative_to);
     if (ret != ESP_OK) {
@@ -200,7 +235,7 @@ esp_err_t ads_config(const uint8_t channel, const uint8_t relative_to, const dou
     i2c_master_stop(cmd);
 
     // begin the command
-    ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, 1000 / portTICK_PERIOD_MS);
+    ret = i2c_master_cmd_begin(i2c_port_num, cmd, 1000 / portTICK_PERIOD_MS);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "i2c_master_begin failed %d", ret);
         i2c_cmd_link_delete(cmd);
@@ -228,7 +263,7 @@ err_finish:
  * to indicate that the conversion is complete and the
  * conversion result is ready in the Conversion Register
  */
-bool os_ready(void) {
+bool os_ready(const i2c_port_t i2c_port_num) {
     // create an I2C command link
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     if (cmd == NULL) {
@@ -265,7 +300,7 @@ bool os_ready(void) {
     // Stop bit
     i2c_master_stop(cmd);
     // begin the command
-    e = i2c_master_cmd_begin(I2C_NUM_0, cmd, 1000 / portTICK_PERIOD_MS);
+    e = i2c_master_cmd_begin(i2c_port_num, cmd, 1000 / portTICK_PERIOD_MS);
     if (e != ESP_OK) goto err_finish;
 
     // the value of the OS bit
@@ -290,9 +325,9 @@ err_finish:
  * a proper PGA FSR setting. The 4th argument is a pointer
  * to a uint16_t value, where the read value will be stored
  */
-esp_err_t ads_read(const uint8_t channel, const uint8_t relative_to, const double max_voltage_input, int16_t *value) {
+esp_err_t ads_read(const uint8_t channel, const uint8_t relative_to, const i2c_port_t i2c_port_num, const double max_voltage_input, int16_t *value) {
     // first, configuration of an ADS111x
-    esp_err_t ret = ads_config(channel, relative_to, max_voltage_input);
+    esp_err_t ret = ads_config(channel, relative_to, i2c_port_num, max_voltage_input);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "ads_read failed");
         return ret;
@@ -300,7 +335,7 @@ esp_err_t ads_read(const uint8_t channel, const uint8_t relative_to, const doubl
 
     // wait for the conversion to end
     for (;;) {
-        if (os_ready()) break;
+        if (os_ready(i2c_port_num)) break;
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
@@ -342,7 +377,7 @@ esp_err_t ads_read(const uint8_t channel, const uint8_t relative_to, const doubl
     // Stop bit
     i2c_master_stop(cmd);
     // begin the command
-    ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, 1000 / portTICK_PERIOD_MS);
+    ret = i2c_master_cmd_begin(i2c_port_num, cmd, 1000 / portTICK_PERIOD_MS);
     if (ret != ESP_OK) goto err_finish;
 
     // delete the command link
